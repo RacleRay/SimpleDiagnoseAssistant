@@ -1,0 +1,6 @@
+flask
+redis
+neo4j-driver
+transformers==2.9.1
+torch==1.4.0
+pyahocorasick==1.4.1
