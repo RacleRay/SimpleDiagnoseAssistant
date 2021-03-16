@@ -13,12 +13,10 @@ tokenizer = BertTokenizer.from_pretrained(MODEL_PATH)
 
 class BERTPairFine(nn.Module):
     """
-    两种选择：
-    一种，直接将这个模型用于预测匹配对，当做二分类问题，训练集准确率是很高的，这种场景不需要更复杂的模型就可以解决；
-          但是更复杂一些的任务，给出一对句子, 使用1~5的评分评价两者在语义上的相似程度(STS-B, 回归任务)，那么BertWhitening效果会更好。
-          没有很多监督数据时，BertWhitening可以出场。此时的 fine tuning 使用 mask LM 和 next sentence prediction，BERTPairFine不再适用。
-          没有很多监督数据时，BertWhitening不fine tune也有一定效果。
-    另一种，只用于预训练bert，训练好之后的模型用于 BERT whitening使用。使用方式比较navie，替换BertWhitening中的model，然后只使用本模型的BERT部分，即可"""
+    直接将这个模型用于预测匹配对，当做二分类问题，训练集准确率是很高的，这种场景不需要更复杂的模型就可以解决；
+    但是更复杂一些的任务，给出一对句子, 使用1~5的评分评价两者在语义上的相似程度(STS-B)。
+    没有标注，无监督任务时，可以使用BertWhitening。BERT在任务相关的语料中 fine tune 再使用。
+    """
     def __init__(self, max_len=60, embed_size=768, fc_size=16, train_bert=False):
         super(BERTPairFine, self).__init__()
         self.train_bert = train_bert
@@ -65,7 +63,62 @@ class BERTPairFine(nn.Module):
         return last_hidden_state, pooler_output, all_layerout
 
 
+
+class BertPairSim(nn.Module):
+    """
+    给出一对句子, 使用1~5的评分评价两者在语义上的相似程度(STS-B)，同时使用标注训练。
+    针对 cosine similarity 评价指标，设计损失函数直接训练。STS-B任务 pearson correlation 0.83
+    指标：
+        Spear-man’s  rank  correlation  between  the  cosine  similarity  of  sentence  embeddings  and  the  gold  labels  on  multipledatasets.
+    """
+    def __init__(self, bert_size=768, hidden_size=1024, train_bert=False, **kwargs):
+        super().__init__()
+        self.train_bert = False
+
+        config = BertConfig.from_json_file(os.path.join(MODEL_PATH, "config.json"))
+        config.output_hidden_states = True
+
+        self.model = BertModel.from_pretrained(MODEL_PATH, config=config).cuda()
+
+        self.fc = nn.Linear(bert_size, hidden_size)
+        self.activation = nn.Tanh()
+
+        self.fc.weight.data.normal_(mean=0.0, std=0.02)
+
+    def compute_cosim(self, vec1, vec2):
+        return torch.nn.CosineSimilarity(dim=1, eps=1e-6)
+
+    def forward(self, ids, masks):
+        if not self.train_bert:
+            with torch.no_grad():
+                last_hidden_state, pooler_output, all_layerout = self.model(ids,
+                                                                attention_mask=masks)
+        else:
+            last_hidden_state, pooler_output, all_layerout = self.model(ids,
+                                                            attention_mask=masks)
+
+        outvec = self.activation(self.fc(pooler_output))
+        return outvec
+
+    def loss_fn(self, vec1, vec2, label, device):
+        """
+        vec1, vec2 分别为 ids1， ids2 通过 forward 计算的结果
+            ```
+            vec1 = model(ids1, mask)
+            vec2 = model(ids2, mask)
+            ```
+        """
+        cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6).to(device)
+        l1_loss = torch.nn.L1Loss(reduction="mean")
+
+        sim = cos(vec1, vec2)
+        loss = l1_loss(sim, label)
+
+        return loss
+
+
 class BertWhitening(nn.Module):
+    "无监督STS-B任务 0.72"
     def __init__(self, pretrained_path=None, **kwargs):
         super().__init__()
         self.pool = GlobalPooling1d(1)
